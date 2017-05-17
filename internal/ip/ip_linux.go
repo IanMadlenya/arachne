@@ -18,8 +18,35 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-package tcp
+package ip
+
+import (
+	"net"
+	"syscall"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+)
 
 func bindToDevice(s int, ifname string) error {
-	return nil
+	return syscall.BindToDevice(s, ifname)
+}
+
+// GetIPLayerOptions returns the gopacket options for serialization
+func GetIPLayerOptions() gopacket.SerializeOptions {
+	return gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		FixLengths:       true,
+	}
+}
+
+func getIPHeaderLayerV4(tos uint8, tcpLen int, srcIP, dstIP net.IP) (*layers.IPv4, error) {
+	return &layers.IPv4{
+		Version:  4,
+		TOS:      tos,
+		Protocol: layers.IPProtocolTCP,
+		TTL:      64, // TODO: make TTL configurable in target JSON
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+	}, nil
 }

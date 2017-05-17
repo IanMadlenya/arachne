@@ -32,23 +32,20 @@ import (
 	"time"
 
 	"github.com/uber/arachne/defines"
+	"github.com/uber/arachne/internal/ip"
 	"github.com/uber/arachne/internal/log"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"github.com/pkg/errors"
 	"github.com/spacemonkeygo/monotime"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
-// TCP flags
-const (
-	fin uint8 = (1 << iota) // 00 0001
-	syn                     // 00 0010
-	rst                     // 00 0100
-	psh                     // 00 1000
-	ack                     // 01 0000
-	urg                     // 10 0000
-)
+type tcpFlags struct {
+	fin, syn, rst, psh, ack, urg, ece, cwr, ns bool
+}
 
 type echoType uint8
 
@@ -83,36 +80,9 @@ func (q echoType) text(logger *log.Logger) string {
 const tcpHdrSize int = 20 // 20 bytes without any TCP Options
 const maxTCPPacketSizeBytes int = 65 * 1024
 
-type tcpPacket struct {
-	tcpHeader
-	tcpPayload
-}
-
-// tcpHeader defines the TCP header struct,
-type tcpHeader struct {
-	srcPort    uint16
-	dstPort    uint16
-	seqNum     uint32
-	ackNum     uint32
-	dataOffset uint8 // 4 bits
-	reserved   uint8 // 3 bits
-	ECN        uint8 // 3 bits
-	ctrl       uint8 // 6 bits
-	window     uint16
-	checksum   uint16
-	urgent     uint16
-	options    []tcpOption
-}
-
-type tcpOption struct {
-	Kind   uint8
-	Length uint8
-	Data   []byte
-}
-
-// tcpPayload defines the TCP payload struct.
-type tcpPayload struct {
-	Ts time.Time
+type arachneTCPPacket struct {
+	header  layers.TCP
+	payload time.Time
 }
 
 // Message is filled with the info about the 'echo' request sent or 'echo' reply received and
@@ -121,7 +91,7 @@ type Message struct {
 	Type    echoType
 	SrcAddr net.IP
 	DstAddr net.IP
-	Af      string
+	Af      int
 	SrcPort uint16
 	DstPort uint16
 	QosDSCP DSCPValue
@@ -229,193 +199,123 @@ var (
 )
 
 // Parse TCP Echo header from received packet.
-func parsePkt(data []byte, listenPort uint16) (*tcpPacket, bool) {
-	var pkt tcpPacket
+func parsePkt(af int, data []byte, listenPort uint16) (tcpPkt *arachneTCPPacket, destinedToArachne bool) {
+	var (
+		tcp              layers.TCP
+		payload          gopacket.Payload
+		unmarshalledTime time.Time
+	)
 
-	r := bytes.NewReader(data)
-	binary.Read(r, binary.BigEndian, &pkt.srcPort)
-	binary.Read(r, binary.BigEndian, &pkt.dstPort)
-
-	if uint16(pkt.dstPort) != listenPort &&
-		(uint16(pkt.srcPort) != defines.PortHTTP && uint16(pkt.srcPort) != defines.PortHTTPS) {
-		return nil, false
-	}
-	binary.Read(r, binary.BigEndian, &pkt.seqNum)
-	binary.Read(r, binary.BigEndian, &pkt.ackNum)
-
-	var mix uint16
-	binary.Read(r, binary.BigEndian, &mix)
-	pkt.dataOffset = byte(mix >> 12)  // top 4 bits
-	pkt.reserved = byte(mix >> 9 & 7) // 3 bits
-	pkt.ECN = byte(mix >> 6 & 7)      // 3 bits
-	pkt.ctrl = byte(mix & 0x3f)       // bottom 6 bits
-
-	binary.Read(r, binary.BigEndian, &pkt.window)
-	binary.Read(r, binary.BigEndian, &pkt.checksum)
-	binary.Read(r, binary.BigEndian, &pkt.urgent)
-
-	if pkt.dataOffset > 5 {
-		binary.Read(r, binary.BigEndian, &pkt.options)
+	if af == defines.AfInet {
+		data = data[20:]
 	}
 
-	headerLen := pkt.dataOffset * 4
-	if len(data) > int(headerLen) {
-		ts := make([]byte, defines.TimestampPayloadLengthBytes)
-		binary.Read(r, binary.BigEndian, &ts)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeTCP, &tcp, &payload)
 
-		var unByteTime time.Time
-		if err := unByteTime.UnmarshalBinary(ts); err == nil {
-			pkt.Ts = unByteTime
+	decodedLayers := make([]gopacket.LayerType, 0, 2)
+	err := parser.DecodeLayers(data, &decodedLayers)
+	if err != nil {
+		destinedToArachne = false
+		return
+	}
+	if uint16(tcp.DstPort) != listenPort &&
+		((uint16(tcp.SrcPort) != defines.PortHTTP) && (uint16(tcp.SrcPort) != defines.PortHTTPS)) {
+		destinedToArachne = false
+		return
+	}
+
+	destinedToArachne = true
+	tcpPkt = &arachneTCPPacket{header: tcp}
+
+	if payload != nil {
+		ts := append([]byte(nil), payload[:defines.TimestampPayloadLengthBytes]...)
+		err = unmarshalledTime.UnmarshalBinary(ts)
+		if err == nil {
+			tcpPkt.payload = unmarshalledTime
 		}
 	}
 
-	return &pkt, true
+	return
 }
 
 // makePkt creates and serializes a TCP Echo.
 func makePkt(
-	af string,
-	srcAddr *net.IP,
-	dstAddr *net.IP,
+	af int,
+	srcAddr net.IP,
+	dstAddr net.IP,
 	srcPort uint16,
 	dstPort uint16,
-	flags uint8,
+	dscpv DSCPValue,
+	flags tcpFlags,
 	seqNum uint32,
 	ackNum uint32,
 ) ([]byte, error) {
-	var err error
-	packet := tcpPacket{
-		tcpHeader{
-			srcPort:    uint16(srcPort), // ephemeral port
-			dstPort:    uint16(dstPort),
-			seqNum:     seqNum,
-			ackNum:     ackNum,
-			dataOffset: uint8(5), // 4 bits
-			reserved:   0,        // 3 bits
-			ECN:        0,        // 3 bits
-			ctrl:       flags,    // 6 bits (000010, SYN bit set)
-			window:     0xaaaa,   // The amount of data that it is able to accept in bytes
-			checksum:   0,        // Kernel will set this if it's 0
-			urgent:     0,
-			options:    []tcpOption{},
-		},
-		tcpPayload{},
+	var (
+		err         error
+		payloadTime []byte
+	)
+
+	buf := gopacket.NewSerializeBuffer()
+	optsIP := ip.GetIPLayerOptions()
+	optsTCP := gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		FixLengths:       true,
 	}
 
 	// When replying with SYN+ACK, a time-stamped payload is included
-	if flags&syn != 0 && flags&ack != 0 {
-		packet.tcpPayload.Ts = timeNow()
+	if flags.syn != false && flags.ack != false {
+		payloadTime, err = timeNow().MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		payloadLayer := gopacket.Payload(payloadTime)
+		payloadLayer.SerializeTo(buf, optsTCP)
 	}
-	bytes := packet.Marshal()
-	packet.checksum, err = checksum(af, bytes, srcAddr, dstAddr)
+
+	tcpLayer := &layers.TCP{
+		SrcPort:    layers.TCPPort(srcPort),
+		DstPort:    layers.TCPPort(dstPort),
+		Seq:        seqNum,
+		Ack:        ackNum,
+		DataOffset: uint8(5),
+		SYN:        flags.syn,
+		RST:        flags.rst,
+		ACK:        flags.ack,
+		Window:     0xaaaa,
+		Checksum:   0,
+	}
+
+	tcpLen := 20 + len(buf.Bytes())
+	ipLayer, err := ip.GetIPHeaderLayer(af, uint8(dscpv), tcpLen, srcAddr, dstAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	return packet.Marshal(), nil
-}
+	tcpLayer.SetNetworkLayerForChecksum(ipLayer)
 
-// Marshal emits raw bytes for the packet.
-func (pkt *tcpPacket) Marshal() []byte {
-
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, pkt.srcPort)
-	binary.Write(buf, binary.BigEndian, pkt.dstPort)
-	binary.Write(buf, binary.BigEndian, pkt.seqNum)
-	binary.Write(buf, binary.BigEndian, pkt.ackNum)
-
-	var mix uint16
-	mix = uint16(pkt.dataOffset)<<12 | // top 4 bits
-		uint16(pkt.reserved)<<9 | // 3 bits
-		uint16(pkt.ECN)<<6 | // 3 bits
-		uint16(pkt.ctrl) // bottom 6 bits
-	binary.Write(buf, binary.BigEndian, mix)
-
-	binary.Write(buf, binary.BigEndian, pkt.window)
-	binary.Write(buf, binary.BigEndian, pkt.checksum)
-	binary.Write(buf, binary.BigEndian, pkt.urgent)
-
-	for _, option := range pkt.options {
-		binary.Write(buf, binary.BigEndian, option.Kind)
-		if option.Length > 1 {
-			binary.Write(buf, binary.BigEndian, option.Length)
-			binary.Write(buf, binary.BigEndian, option.Data)
-		}
+	err = tcpLayer.SerializeTo(buf, optsTCP)
+	if err != nil {
+		return nil, err
 	}
 
-	if pkt.tcpPayload != (tcpPayload{}) {
-		byteTime, err := pkt.tcpPayload.Ts.MarshalBinary()
-		if err == nil {
-			binary.Write(buf, binary.BigEndian, byteTime)
-		}
+	switch ipLayer.(type) {
+	case *layers.IPv4:
+		err = ipLayer.(*layers.IPv4).SerializeTo(buf, optsIP)
+	case *layers.IPv6:
+		err = ipLayer.(*layers.IPv6).SerializeTo(buf, optsIP)
+	}
+	if err != nil {
+		return nil, err
 	}
 
-	out := buf.Bytes()
-
-	return out
-}
-
-func (tcp *tcpHeader) hasFlag(flagBit byte) bool {
-	return tcp.ctrl&flagBit != 0
-}
-
-// TCP Checksum
-func checksum(af string, data []byte, srcip, dstip *net.IP) (uint16, error) {
-
-	// the pseudo header used for TCP c-sum computation
-	var pseudoHeader []byte
-
-	pseudoHeader = append(pseudoHeader, *srcip...)
-	pseudoHeader = append(pseudoHeader, *dstip...)
-	switch af {
-	case "ip4":
-		pseudoHeader = append(pseudoHeader, []byte{
-			0,
-			6,                  // protocol number for TCP
-			0, byte(len(data)), // TCP length (16 bits), w/o pseudoheader
-		}...)
-	case "ip6":
-		pseudoHeader = append(pseudoHeader, []byte{
-			0, 0, 0, byte(len(data)), // TCP length (32 bits), w/0 pseudoheader
-			0, 0, 0,
-			6, // protocol number for TCP
-		}...)
-	default:
-		return 0, errors.New("unhandled AF family")
-	}
-
-	body := make([]byte, 0, len(pseudoHeader)+len(data))
-	body = append(body, pseudoHeader...)
-	body = append(body, data...)
-
-	bodyLen := len(body)
-
-	var word uint16
-	var csum uint32
-
-	for i := 0; i+1 < bodyLen; i += 2 {
-		word = uint16(body[i])<<8 | uint16(body[i+1])
-		csum += uint32(word)
-	}
-
-	if bodyLen%2 != 0 {
-		csum += uint32(body[len(body)-1])
-	}
-
-	csum = (csum >> 16) + (csum & 0xffff)
-	csum = csum + (csum >> 16)
-
-	// Bitwise complement
-	return uint16(^csum), nil
+	return buf.Bytes(), nil
 }
 
 // Receiver checks if the incoming packet is actually a response to our probe and acts accordingly.
 //TODO Test IPv6
 func Receiver(
-	af string,
-	srcAddr *net.IP,
+	conn ip.Conn,
 	listenPort uint16,
-	interfaceName string,
 	sentC chan Message,
 	rcvdC chan Message,
 	kill chan struct{},
@@ -423,49 +323,24 @@ func Receiver(
 ) error {
 
 	var (
-		recvSocket  int
 		ipHdrSize   int
-		err         error
 		receiveTime time.Time
 	)
 
-	logger.Info("TCP receiver starting...", zap.String("AF", af))
-
-	// create the socket
-	switch af {
-	case "ip4":
-		recvSocket, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
-		// IPv4 header is always included with the ipv4 raw socket receive
-		ipHdrSize = 20
-	case "ip6":
-		recvSocket, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
-		// no IPv6 header present on TCP packets received on the raw socket
-		ipHdrSize = 0
-	default:
-		return errors.New("unhandled AF family")
-	}
-	if err != nil {
-		return errors.Wrapf(err, "failed to create %s receive socket", af)
-	}
-
-	if err := bindToDevice(recvSocket, interfaceName); err != nil {
-		return errors.Wrapf(err, "failed to bind %s receive socket to interface %s", af, interfaceName)
-	}
+	logger.Info("TCP receiver starting...")
 
 	// IP + TCP header, this channel is fed from the socket
 	in := make(chan Message, defines.ChannelInBufferSize)
 
 	go func() {
-		defer syscall.Close(recvSocket)
 		defer close(in)
 
 		rawPacket := make([]byte, maxTCPPacketSizeBytes)
 		for {
-			n, from, err := syscall.Recvfrom(recvSocket, rawPacket, 0)
+			n, from, err := conn.Recvfrom(rawPacket)
 			// parent has closed the socket likely
 			if err != nil {
 				logger.Fatal("failed to receive from receiver socket",
-					zap.String("AF", af),
 					zap.Error(err))
 			}
 			receiveTime = monoNow()
@@ -478,7 +353,7 @@ func Receiver(
 				continue
 			}
 
-			pkt, destinedToArachne := parsePkt(rawPacket[ipHdrSize:], listenPort)
+			pkt, destinedToArachne := parsePkt(conn.AF, rawPacket, listenPort)
 			if !destinedToArachne {
 				continue
 			}
@@ -494,54 +369,54 @@ func Receiver(
 			}
 
 			var fromAddr net.IP
-			switch af {
-			case "ip4":
+			switch conn.AF {
+			case defines.AfInet:
 				fromAddr = net.IP((from.(*syscall.SockaddrInet4).Addr)[:])
-			case "ip6":
+			case defines.AfInet6:
 				fromAddr = net.IP((from.(*syscall.SockaddrInet6).Addr)[:])
-			default:
-				logger.Fatal("unhandled AF family", zap.String("AF", af))
 			}
 
 			fromAddrStr := fromAddr.String()
 			switch {
-			case pkt.hasFlag(syn) && !pkt.hasFlag(ack):
+			case pkt.header.SYN && !pkt.header.ACK:
 				// Received SYN (Open port)
 				logger.Debug("Received",
 					zap.String("flag", "SYN"),
 					zap.String("src_address", fromAddrStr),
-					zap.Uint16("src_port", pkt.srcPort))
+					zap.Any("src_port", pkt.header.SrcPort))
 
 				// Replying with SYN+ACK to Arachne agent
-				srcPortRange := PortRange{pkt.srcPort, pkt.srcPort}
+				srcPortRange := PortRange{uint16(pkt.header.SrcPort), uint16(pkt.header.SrcPort)}
 				seqNum := rand.Uint32()
-				ackNum := pkt.seqNum + 1
-				err = send(af, srcAddr, &fromAddr, listenPort, srcPortRange, DSCPv,
-					syn|ack, seqNum, ackNum, sentC, kill, logger)
+				ackNum := pkt.header.Seq + 1
+				flags := tcpFlags{syn: true, ack: true}
+				err = send(conn, &fromAddr, listenPort, srcPortRange, DSCPv,
+					flags, seqNum, ackNum, sentC, kill, logger)
+
 				if err != nil {
 					logger.Error("failed to send SYN-ACK", zap.Error(err))
 				}
 
-			case pkt.hasFlag(syn) && pkt.hasFlag(ack):
+			case pkt.header.SYN && pkt.header.ACK:
 				// Received SYN+ACK (Open port)
 				logger.Debug("Received",
 					zap.String("flag", "SYN ACK"),
 					zap.String("src_address", fromAddrStr),
-					zap.Uint16("src_port", pkt.srcPort))
+					zap.Any("src_port", pkt.header.SrcPort))
 
 				inMsg := Message{
 					Type:    EchoReply,
 					SrcAddr: fromAddr,
-					DstAddr: *srcAddr,
-					Af:      af,
-					SrcPort: uint16(pkt.srcPort),
-					DstPort: uint16(pkt.dstPort),
+					DstAddr: conn.SrcAddr,
+					Af:      conn.AF,
+					SrcPort: uint16(pkt.header.SrcPort),
+					DstPort: uint16(pkt.header.DstPort),
 					QosDSCP: DSCPv,
 					Ts: Timestamp{
 						Run:     receiveTime,
-						Payload: pkt.tcpPayload.Ts},
-					Seq: pkt.seqNum,
-					Ack: pkt.ackNum,
+						Payload: pkt.payload},
+					Seq: pkt.header.Seq,
+					Ack: pkt.header.Ack,
 				}
 				// Send 'echo' reply message received to collector
 				in <- inMsg
@@ -549,28 +424,29 @@ func Receiver(
 				if inMsg.FromExternalTarget(listenPort) {
 					//TODO verify
 					// Replying with RST only to external target
-					srcPortRange := PortRange{pkt.srcPort, pkt.srcPort}
-					seqNum := pkt.ackNum
-					ackNum := pkt.seqNum + 1
-					err = send(af, srcAddr, &fromAddr, defines.PortHTTPS, srcPortRange,
-						DSCPBeLow, rst, seqNum, ackNum, sentC, kill, logger)
+					srcPortRange := PortRange{uint16(pkt.header.SrcPort), uint16(pkt.header.SrcPort)}
+					seqNum := pkt.header.Ack
+					ackNum := pkt.header.Seq + 1
+					flags := tcpFlags{rst: true}
+					err = send(conn, &fromAddr, defines.PortHTTPS, srcPortRange,
+						DSCPBeLow, flags, seqNum, ackNum, sentC, kill, logger)
 					if err != nil {
 						logger.Error("failed to send RST", zap.Error(err))
 					}
 				}
 
-			case pkt.hasFlag(rst):
+			case pkt.header.RST:
 				// Received RST (closed port or reset from other side)
 				logger.Warn("Received",
 					zap.String("flag", "RST"),
 					zap.String("src_address", fromAddrStr),
-					zap.Uint16("src_port", pkt.srcPort))
+					zap.Any("src_port", pkt.header.SrcPort))
 
 			}
 
 			select {
 			case <-kill:
-				logger.Info("TCP receiver terminating...", zap.String("AF", af))
+				logger.Info("TCP receiver terminating...")
 				return
 			default:
 				continue
@@ -596,7 +472,7 @@ func Receiver(
 // EchoTargets sends echoes (SYNs) to all targets included in 'remotes.'
 func EchoTargets(
 	remotes interface{},
-	srcAddr *net.IP,
+	conn ip.Conn,
 	targetPort uint16,
 	srcPortRange PortRange,
 	QoSEnabled bool,
@@ -619,7 +495,7 @@ func EchoTargets(
 				} else {
 					*currentDSCP = GetDSCP[i]
 				}
-				echoTargetsWorker(remotes, srcAddr, targetPort, srcPortRange, *currentDSCP,
+				echoTargetsWorker(remotes, conn, targetPort, srcPortRange, *currentDSCP,
 					realBatchInterval, batchEndCycle, sentC, kill, logger)
 				select {
 				case <-kill:
@@ -652,7 +528,7 @@ func EchoTargets(
 
 func echoTargetsWorker(
 	remotes interface{},
-	srcAddr *net.IP,
+	conn ip.Conn,
 	targetPort uint16,
 	srcPortRange PortRange,
 	DSCPv DSCPValue,
@@ -682,14 +558,15 @@ func echoTargetsWorker(
 		ext := remoteStruct.FieldByName("External").Bool()
 
 		// Send SYN with random SEQ
+		flags := tcpFlags{syn: true}
 		port := targetPort
 		qos := DSCPv
 		if ext {
 			port = defines.PortHTTPS
 			qos = DSCPBeLow
 		}
-		err := send(remoteStruct.FieldByName("AF").String(), srcAddr, &dstAddr, port, srcPortRange, qos,
-			syn, rand.Uint32(), 0, sentC, kill, logger)
+		err := send(conn, &dstAddr, port, srcPortRange, qos,
+			flags, rand.Uint32(), 0, sentC, kill, logger)
 		if err != nil {
 			return err
 		}
@@ -708,112 +585,49 @@ func echoTargetsWorker(
 // The packet are injected into raw socket and their descriptions are published to the output channel as Probe messages.
 //TODO Test IPv6
 func send(
-	af string,
-	srcAddr *net.IP,
+	conn ip.Conn,
 	dstAddr *net.IP,
 	targetPort uint16,
 	srcPortRange PortRange,
 	DSCPv DSCPValue,
-	ctrlFlags uint8,
+	ctrlFlags tcpFlags,
 	seqNum uint32,
 	ackNum uint32,
 	sentC chan Message,
 	kill chan struct{},
 	logger *log.Logger,
 ) error {
-	var (
-		flag       string
-		err        error
-		sendSocket int
-	)
-
-	// create the socket
-	switch af {
-	case "ip4":
-		sendSocket, err = syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
-	case "ip6":
-		sendSocket, err = syscall.Socket(syscall.AF_INET6, syscall.SOCK_RAW, syscall.IPPROTO_TCP)
-	default:
-		return errors.New("unhandled AF family")
-	}
-	if err != nil {
-		return err
-	}
-
-	// bind the socket
-	switch af {
-	case "ip4":
-		var sockaddr [4]byte
-		copy(sockaddr[:], srcAddr.To4())
-		err = syscall.Bind(sendSocket, &syscall.SockaddrInet4{Port: 0, Addr: sockaddr})
-	case "ip6":
-		var sockaddr [16]byte
-		copy(sockaddr[:], srcAddr.To16())
-		err = syscall.Bind(sendSocket, &syscall.SockaddrInet6{Port: 0, Addr: sockaddr})
-	default:
-
-		return errors.New("unhandled AF family")
-	}
-	if err != nil {
-		return err
-	}
-
-	// set the QoS DSCP on the socket by setting the TOS field value
-	switch af {
-	case "ip4":
-		err = syscall.SetsockoptInt(sendSocket, syscall.IPPROTO_IP, syscall.IP_TOS, int(DSCPv))
-	case "ip6":
-		err = syscall.SetsockoptInt(sendSocket, syscall.IPPROTO_IPV6, syscall.IPV6_TCLASS, int(DSCPv))
-	}
-	if err != nil {
-		return err
-	}
+	var flag string
 
 	switch {
-	case (ctrlFlags&syn != 0) && (ctrlFlags&ack == 0):
+	case (ctrlFlags.syn != false) && (ctrlFlags.ack == false):
 		flag = "SYN"
-	case ctrlFlags&syn != 0 && (ctrlFlags&ack != 0):
+	case ctrlFlags.syn != false && (ctrlFlags.ack != false):
 		flag = "SYN ACK"
-	case ctrlFlags&rst != 0:
+	case ctrlFlags.rst != false:
 		flag = "RST"
 	default:
 		flag = ""
 	}
 
 	go func() {
-		defer syscall.Close(sendSocket)
-
 		rand.Seed(time.Now().UnixNano())
 		for srcPort := srcPortRange[0]; srcPort <= srcPortRange[1]; srcPort++ {
 
 			zf := []zapcore.Field{
 				zap.String("flag", flag),
-				zap.String("src_address", srcAddr.String()),
-				zap.Uint16("src_port", srcPort),
+				zap.String("src_address", conn.SrcAddr.String()),
+				zap.Any("src_port", srcPort),
 				zap.String("dst_address", dstAddr.String()),
-				zap.Uint16("dst_port", targetPort)}
+				zap.Any("dst_port", targetPort)}
 
-			packet, err := makePkt(af, srcAddr, dstAddr, srcPort, targetPort, ctrlFlags, seqNum, ackNum)
+			packet, err := makePkt(conn.AF, conn.SrcAddr, *dstAddr, srcPort, targetPort, DSCPv, ctrlFlags, seqNum, ackNum)
 			if err != nil {
 				logger.Error("error creating packet", zap.Error(err))
 				goto cont
 			}
 
-			switch af {
-			case "ip4":
-				var sockAddr [4]byte
-				copy(sockAddr[:], dstAddr.To4())
-				err = syscall.Sendto(sendSocket, packet, 0,
-					&syscall.SockaddrInet4{Port: 0, Addr: sockAddr})
-			case "ip6":
-				var sockAddr [16]byte
-				copy(sockAddr[:], dstAddr.To16())
-				// with IPv6 the dst port must be zero, otherwise the syscall fails
-				err = syscall.Sendto(sendSocket, packet, 0,
-					&syscall.SockaddrInet6{Port: 0, Addr: sockAddr})
-			default:
-				logger.Fatal("unhandled AF family", zap.String("AF", af))
-			}
+			err = conn.Sendto(packet, *dstAddr)
 
 			if err == nil {
 				logger.Debug("Sent", zf...)
@@ -821,9 +635,9 @@ func send(
 					// Send 'echo' request message to collector
 					sentC <- Message{
 						Type:    EchoRequest,
-						SrcAddr: *srcAddr,
+						SrcAddr: conn.SrcAddr,
 						DstAddr: *dstAddr,
-						Af:      af,
+						Af:      conn.AF,
 						SrcPort: srcPort,
 						QosDSCP: DSCPv,
 						Ts: Timestamp{
@@ -834,6 +648,7 @@ func send(
 					}
 				}
 			} else {
+				zf = append(zf, zap.Error(err))
 				logger.Error("failed to send out", zf...)
 			}
 

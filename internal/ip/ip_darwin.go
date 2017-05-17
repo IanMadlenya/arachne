@@ -18,10 +18,49 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-package tcp
+package ip
 
-import "syscall"
+import (
+	"net"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+)
 
 func bindToDevice(s int, ifname string) error {
-	return syscall.BindToDevice(s, ifname)
+	return nil
+}
+
+// GetIPLayerOptions is used to get the gopacket serialization optinos
+func GetIPLayerOptions() gopacket.SerializeOptions {
+	return gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		// Gopacket does not support making lengths host-byte order for BSD-based
+		// Kernels
+		FixLengths: false,
+	}
+}
+
+func getIPHeaderLayerV4(tos uint8, tcpLen int, srcIP, dstIP net.IP) (*layers.IPv4, error) {
+	header := &layers.IPv4{
+		Version:    4,
+		TOS:        tos,
+		IHL:        5,
+		Length:     uint16(tcpLen) + 20,
+		FragOffset: 0,
+		Flags:      0,
+		TTL:        64, // TODO: make TTL configurable in target JSON
+		Protocol:   layers.IPProtocolTCP,
+		Checksum:   0,
+		SrcIP:      srcIP,
+		DstIP:      dstIP,
+	}
+
+	// Length and FragOffset must be in host-byte order on Darwin
+	header.Length = (header.Length << 8) | (header.Length >> 8)
+	nf := layers.IPv4Flag(header.FragOffset & 0xE0)
+	header.FragOffset = (header.FragOffset & 0x1F << 8) | (header.FragOffset>>8 | uint16(header.Flags))
+	header.Flags = nf
+
+	return header, nil
 }
