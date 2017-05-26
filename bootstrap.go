@@ -159,7 +159,7 @@ func Run(ec *config.Extended, opts ...Option) {
 		if !*gl.CLI.SenderOnlyMode {
 			// Listen for responses or probes from other IPv4 arachne agents.
 			killC.Receiver = make(chan struct{})
-			err = tcp.Receiver(*connIPv4, gl.RemoteConfig.TargetTCPPort, sentC, rcvdC, killC.Receiver, logger)
+			err = tcp.Receiver(connIPv4, gl.RemoteConfig.TargetTCPPort, sentC, rcvdC, killC.Receiver, logger)
 			if err != nil {
 				logger.Fatal("IPv4 receiver failed to start", zap.Error(err))
 			}
@@ -171,7 +171,7 @@ func Run(ec *config.Extended, opts ...Option) {
 			logger.Debug("Echoing...")
 			// Start echoing all targets.
 			killC.Echo = make(chan struct{})
-			tcp.EchoTargets(gl.Remotes, *connIPv4, gl.RemoteConfig.TargetTCPPort,
+			tcp.EchoTargets(gl.Remotes, connIPv4, gl.RemoteConfig.TargetTCPPort,
 				gl.RemoteConfig.SrcTCPPortRange, gl.RemoteConfig.QoSEnabled, &currentDSCP,
 				realBatchInterval, batchEndCycle, sentC, *gl.CLI.SenderOnlyMode,
 				completeCycleUpload, &finishedCycleUpload, killC.Echo, logger)

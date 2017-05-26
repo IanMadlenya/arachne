@@ -314,7 +314,7 @@ func makePkt(
 // Receiver checks if the incoming packet is actually a response to our probe and acts accordingly.
 //TODO Test IPv6
 func Receiver(
-	conn ip.Conn,
+	conn *ip.Conn,
 	listenPort uint16,
 	sentC chan Message,
 	rcvdC chan Message,
@@ -472,7 +472,7 @@ func Receiver(
 // EchoTargets sends echoes (SYNs) to all targets included in 'remotes.'
 func EchoTargets(
 	remotes interface{},
-	conn ip.Conn,
+	conn *ip.Conn,
 	targetPort uint16,
 	srcPortRange PortRange,
 	QoSEnabled bool,
@@ -528,7 +528,7 @@ func EchoTargets(
 
 func echoTargetsWorker(
 	remotes interface{},
-	conn ip.Conn,
+	conn *ip.Conn,
 	targetPort uint16,
 	srcPortRange PortRange,
 	DSCPv DSCPValue,
@@ -585,7 +585,7 @@ func echoTargetsWorker(
 // The packet are injected into raw socket and their descriptions are published to the output channel as Probe messages.
 //TODO Test IPv6
 func send(
-	conn ip.Conn,
+	conn *ip.Conn,
 	dstAddr *net.IP,
 	targetPort uint16,
 	srcPortRange PortRange,
