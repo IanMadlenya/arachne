@@ -343,7 +343,6 @@ func Receiver(
 				logger.Fatal("failed to receive from receiver socket",
 					zap.Error(err))
 			}
-			receiveTime = monoNow()
 
 			// IP + TCP header size
 			if n < ipHdrSize+tcpHdrSize {
@@ -357,6 +356,7 @@ func Receiver(
 			if !destinedToArachne {
 				continue
 			}
+			receiveTime = monoNow()
 
 			var DSCPv DSCPValue
 			r := bytes.NewReader(rawPacket[1:2])

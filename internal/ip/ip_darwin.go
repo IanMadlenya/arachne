@@ -23,6 +23,8 @@ package ip
 import (
 	"net"
 
+	"golang.org/x/net/bpf"
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 )
@@ -63,4 +65,8 @@ func getIPHeaderLayerV4(tos uint8, tcpLen int, srcIP, dstIP net.IP) (*layers.IPv
 	header.Flags = nf
 
 	return header, nil
+}
+
+func (c *Conn) attachBPF(filter []bpf.RawInstruction) error {
+	return nil
 }

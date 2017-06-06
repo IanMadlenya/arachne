@@ -138,7 +138,12 @@ func Run(ec *config.Extended, opts ...Option) {
 
 		// Connection for IPv4 packets
 		if connIPv4 == nil {
-			connIPv4 = ip.NewConn(d.AfInet, gl.RemoteConfig.InterfaceName, gl.RemoteConfig.SrcAddress, logger)
+			connIPv4 = ip.NewConn(
+				d.AfInet,
+				uint32(gl.RemoteConfig.TargetTCPPort),
+				gl.RemoteConfig.InterfaceName,
+				gl.RemoteConfig.SrcAddress,
+				logger)
 		}
 
 		// Actual echoing is a percentage of the total configured batch cycle duration.

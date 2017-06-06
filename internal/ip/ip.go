@@ -25,6 +25,8 @@ import (
 	"net"
 	"syscall"
 
+	"golang.org/x/net/bpf"
+
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/uber/arachne/defines"
@@ -67,13 +69,30 @@ func (c *Conn) Sendto(b []byte, to net.IP) error {
 
 }
 
+// getFilter will attach a BPF filter to a raw connections recv socket
+func getBPFFilter(listenPort uint32) []bpf.RawInstruction {
+	// Our recv socket is of type IP_PROTOTCP, so offset 0 is the start of the ethernet payload (ip header)
+	filter, _ := bpf.Assemble([]bpf.Instruction{
+		bpf.LoadAbsolute{Off: 0, Size: 1},                                           // Load first byte into Register A
+		bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: 0xf0},                              // Register A AND 0xf0 to obtain high-nibble
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: 0x6, SkipTrue: 2},                      // If IPv6, skip, else continue
+		bpf.LoadAbsolute{Off: 22, Size: 2},                                          // Load TCP dst port starting from IPv4 header
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: listenPort, SkipFalse: 3, SkipTrue: 2}, // Check if equal to desired port
+		bpf.LoadAbsolute{Off: 42, Size: 2},                                          // Load TCP dst port starting from IPv6 header
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: listenPort, SkipFalse: 1},              // Check if equal to desired port
+		bpf.RetConstant{Val: 4096},                                                  // Return max 4096 bytes from packet
+		bpf.RetConstant{Val: 0},                                                     // Drop packet
+	})
+
+	return filter
+}
+
 func getSendSocket(af int) (int, error) {
 	fd, err := syscall.Socket(af, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
 	if err != nil {
 		return 0, err
 	}
 
-	// TODO: investigate IPv6 and using IP_HDRINCL
 	err = syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1)
 	if err != nil {
 		return 0, err
@@ -96,7 +115,7 @@ func getRecvSocket(af int, intf string) (int, error) {
 }
 
 // NewConn returns a raw socket connection to send and receive packets
-func NewConn(af int, intf string, srcAddr net.IP, logger *log.Logger) *Conn {
+func NewConn(af int, listenPort uint32, intf string, srcAddr net.IP, logger *log.Logger) *Conn {
 	fds, err := getSendSocket(af)
 	if err != nil {
 		logger.Fatal("Error creating send socket", zap.Int("address_family", af), zap.Error(err))
@@ -113,6 +132,14 @@ func NewConn(af int, intf string, srcAddr net.IP, logger *log.Logger) *Conn {
 		sendFD:  fds,
 		recvFD:  fdr,
 	}
+
+	filter := getBPFFilter(uint32(listenPort))
+	// Golang syscall.SO_ATTACH_FILTER is available only in linux
+	err = connection.attachBPF(filter)
+	if err != nil {
+		logger.Fatal("Error attaching BPF filter to recv Socket", zap.Error(err))
+	}
+
 	return connection
 }
 

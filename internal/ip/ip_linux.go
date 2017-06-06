@@ -23,6 +23,9 @@ package ip
 import (
 	"net"
 	"syscall"
+	"unsafe"
+
+	"golang.org/x/net/bpf"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -49,4 +52,26 @@ func getIPHeaderLayerV4(tos uint8, tcpLen int, srcIP, dstIP net.IP) (*layers.IPv
 		SrcIP:    srcIP,
 		DstIP:    dstIP,
 	}, nil
+}
+
+// AttachBPF will attach an assembled BPF filter to the connection's recv socket
+func (c *Conn) attachBPF(filter []bpf.RawInstruction) error {
+	prog := syscall.SockFprog{
+		Len:    uint16(len(filter)),
+		Filter: (*syscall.SockFilter)(unsafe.Pointer(&filter[0])),
+	}
+	_, _, err := syscall.Syscall6(
+		syscall.SYS_SETSOCKOPT,
+		uintptr(c.recvFD),
+		uintptr(syscall.SOL_SOCKET),
+		uintptr(syscall.SO_ATTACH_FILTER),
+		uintptr(unsafe.Pointer(&prog)),
+		uintptr(uint32(unsafe.Sizeof(prog))),
+		0,
+	)
+	if err != 0 {
+		return err
+	}
+
+	return nil
 }
