@@ -1,5 +1,5 @@
-hash: 6c48a928ebeb369b08050b29a1169d8350cdd2a5a6337cae4d4dbc29bfeea009
-updated: 2017-05-05T01:01:42.338569518Z
+hash: 40634c1c4ae0b9432d50de342443ed8539c0dbfe1007f895b553f971c04caf79
+updated: 2017-06-06T13:53:33.249039597-04:00
 imports:
 - name: github.com/DataDog/datadog-go
   version: 909c02b65dd8a52e8fa6072db9752a112227cf21
@@ -7,6 +7,10 @@ imports:
   - statsd
 - name: github.com/fatih/color
   version: dea9d3a26a087187530244679c1cfb3a42937794
+- name: github.com/google/gopacket
+  version: e20408befa7dcef61c3c35f53df06d3f8a194e60
+  subpackages:
+  - layers
 - name: github.com/jawher/mow.cli
   version: 772320464101e904cd51198160eb4d489be9cc49
 - name: github.com/mattn/go-colorable
@@ -22,7 +26,7 @@ imports:
   subpackages:
   - _cgo
 - name: github.com/uber-go/zap
-  version: 6a4e056f2cc954cfec3581729e758909604b3f76
+  version: fab453050a7a08c35f31fc5fff6f2dbd962285ab
   subpackages:
   - zapcore
 - name: github.com/uber/uber-licence
@@ -38,6 +42,10 @@ imports:
   - internal/exit
   - internal/multierror
   - zapcore
+- name: golang.org/x/net
+  version: 59a0b19b5533c7977ddeb86b017bf507ed407b12
+  subpackages:
+  - bpf
 - name: golang.org/x/sys
   version: d4feaf1a7e61e1d9e79e6c4e76c6349e9cab0a03
   subpackages:
